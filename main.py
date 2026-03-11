@@ -3,13 +3,13 @@ import pandas as pd
 import numpy as np
 import cvxpy as cp
 import gc
-from typing import List
+from typing import Dict
 
 # Set random seed for reproducibility
 np.random.seed(42)
 
 
-def get_returns(stocks: List[str], period: str = '2y') -> pd.DataFrame:
+def get_returns(stocks: list, period: str = '2y') -> pd.DataFrame:
     """Download historical data and return cleaned returns"""
     print(f"📥 Downloading historical data for {stocks}...")
     
@@ -27,15 +27,19 @@ def get_returns(stocks: List[str], period: str = '2y') -> pd.DataFrame:
         else:
             adj_close = data['Close']
     
+    # Handle potential MultiIndex on rows (date)
+    if isinstance(adj_close, pd.DataFrame):
+        adj_close = adj_close.iloc[:, 0] if adj_close.shape[1] == 1 else adj_close
+    
     # Clean data
     adj_close = adj_close.ffill().dropna(axis=1, thresh=len(adj_close) * 0.8)
     returns = adj_close.pct_change().dropna()
     
-    print(f"✓ Historical data: {len(returns)} days, {len(returns.columns)} stocks")
+    print(f"✓ Historical  {len(returns)} days, {len(returns.columns)} stocks")
     return returns
 
 
-def get_capm_returns(stocks: List[str], returns: pd.DataFrame, 
+def get_capm_returns(stocks: list, returns: pd.DataFrame, 
                      risk_free: float = 0.04, 
                      market_ticker: str = '^GSPC',
                      period: str = '2y') -> pd.Series:
@@ -62,7 +66,7 @@ def get_capm_returns(stocks: List[str], returns: pd.DataFrame,
     
     # Handle potential MultiIndex on rows (date)
     if isinstance(market_close, pd.DataFrame):
-        market_close = market_close.iloc[:, 0]  # Take first column if DataFrame
+        market_close = market_close.iloc[:, 0]
     
     market_close = market_close.ffill().dropna()
     market_returns = market_close.pct_change().dropna()
@@ -111,29 +115,42 @@ def get_capm_returns(stocks: List[str], returns: pd.DataFrame,
     return pd.Series(capm_mu)
 
 
-def solve_cvxpy_portfolio(mu, Sigma, prices, risk_free, target_return, max_k, budget, stocks):
+def solve_tangency_portfolio(mu: np.ndarray, Sigma: np.ndarray, 
+                              risk_free: float, budget: float, 
+                              stocks: list, target_return: float = None) -> Dict:
     """
-    CVXPY Solver with Cardinality Constraint (Max K stocks)
+    Find Tangency Portfolio (Maximum Sharpe Ratio)
+    With optional CML allocation based on target return
+    
+    Mathematical Foundation:
+    max (w'μ - rf) / √(w'Σw)  s.t.  w'1 = 1, w ≥ 0
+    
+    Reformulated as:
+    min x'Σx  s.t.  (μ - rf·1)'x = 1,  then w = x / sum(x)
     """
+    print(f"\n{'='*60}")
+    print(f"🎯 SOLVING TANGENCY PORTFOLIO (Maximum Sharpe Ratio)")
+    print(f"{'='*60}")
+    
     n = len(mu)
     
-    # 1. Find Tangency Portfolio (DCP-compliant)
+    # DCP-compliant tangency portfolio formulation
     x = cp.Variable(n)
     k = cp.Variable()
     
-    constraints_tangency = [
-        (mu - risk_free) @ x == 1,
-        cp.sum(x) == k,
-        x >= 0,
-        k >= 0
+    constraints = [
+        (mu - risk_free) @ x == 1,  # Excess return constraint
+        cp.sum(x) == k,              # Sum of scaled weights
+        x >= 0,                      # Long-only
+        k >= 0                       # Positive scaling
     ]
     
-    prob_tangency = cp.Problem(cp.Minimize(cp.quad_form(x, Sigma)), constraints_tangency)
+    prob = cp.Problem(cp.Minimize(cp.quad_form(x, Sigma)), constraints)
     
     try:
-        prob_tangency.solve(solver=cp.SCS, verbose=False)
+        prob.solve(solver=cp.SCS, verbose=False)
         
-        if prob_tangency.status in ['optimal', 'optimal_inaccurate']:
+        if prob.status in ['optimal', 'optimal_inaccurate']:
             x_val = x.value
             k_val = k.value
             
@@ -141,257 +158,201 @@ def solve_cvxpy_portfolio(mu, Sigma, prices, risk_free, target_return, max_k, bu
                 tangency_weights = x_val / k_val
             else:
                 tangency_weights = np.ones(n) / n
+                print("⚠ Degenerate solution, using equal weights")
         else:
-            print(f"⚠ Tangency solve status: {prob_tangency.status}")
+            print(f"⚠ Optimization status: {prob.status}, using equal weights")
             tangency_weights = np.ones(n) / n
     except Exception as e:
-        print(f"⚠ Tangency solve error: {e}")
+        print(f"⚠ Optimization error: {e}, using equal weights")
         tangency_weights = np.ones(n) / n
     
     # Calculate tangency portfolio metrics
-    tangency_ret = float(mu @ tangency_weights)
-    tangency_vol = float(np.sqrt(tangency_weights @ Sigma @ tangency_weights))
-    tangency_sharpe = (tangency_ret - risk_free) / tangency_vol if tangency_vol > 0 else 0
+    tangency_return = float(mu @ tangency_weights)
+    tangency_volatility = float(np.sqrt(tangency_weights @ Sigma @ tangency_weights))
+    tangency_sharpe = (tangency_return - risk_free) / tangency_volatility if tangency_volatility > 0 else 0
+    
+    print(f"\n📊 TANGENCY PORTFOLIO METRICS:")
+    print(f"   Expected Return:  {tangency_return:>10.2%}")
+    print(f"   Volatility:       {tangency_volatility:>10.2%}")
+    print(f"   Sharpe Ratio:     {tangency_sharpe:>10.2f}")
+    print(f"   Risk-Free Rate:   {risk_free:>10.2%}")
+    
+    print(f"\n{'Stock':<10} {'Weight':<12} {'Expected Return':<15}")
+    print("-" * 40)
+    
+    for i, stock in enumerate(stocks):
+        if tangency_weights[i] > 0.001:
+            print(f"{stock:<10} {tangency_weights[i]:>11.2%} {mu[i]:>14.2%}")
+    
+    print("-" * 40)
+    print(f"{'Total':<10} {tangency_weights.sum():>11.2%}")
+    print(f"{'='*60}")
+    
+    # CML Allocation: Mix Risk-Free + Tangency based on target return
+    weight_rf = 0.0
+    final_weights = tangency_weights.copy()
+    strategy = "100% Tangency Portfolio"
+    
+    if target_return is not None:
+        if target_return < tangency_return:
+            # Use CML: mix risk-free + tangency
+            if tangency_return - risk_free != 0:
+                w_risky = (target_return - risk_free) / (tangency_return - risk_free)
+                w_risky = max(0, min(1, w_risky))  # Clamp to [0, 1]
+                weight_rf = 1.0 - w_risky
+                final_weights = w_risky * tangency_weights
+                strategy = f"CML: {weight_rf:.1%} Risk-Free + {w_risky:.1%} Tangency"
+                
+                print(f"\n📉 Target Return ({target_return:.2%}) < Tangency ({tangency_return:.2%})")
+                print(f"   → Using Capital Market Line (CML)")
+                print(f"   → Strategy: {strategy}")
+        else:
+            print(f"\n📈 Target Return ({target_return:.2%}) >= Tangency ({tangency_return:.2%})")
+            print(f"   → Target exceeds max Sharpe; using 100% tangency portfolio")
+            strategy = "100% Tangency (Target > Max Sharpe)"
+    
+    # Calculate dollar allocation
+    dollar_amounts = final_weights * budget
+    
+    return {
+        'tangency_weights': tangency_weights,
+        'final_weights': final_weights,
+        'weight_rf': weight_rf,
+        'strategy': strategy,
+        'tangency_return': tangency_return,
+        'tangency_volatility': tangency_volatility,
+        'tangency_sharpe': tangency_sharpe,
+        'dollar_amounts': dollar_amounts
+    }
+
+
+def run_monte_carlo_scenarios(weights: np.ndarray, mu: np.ndarray, Sigma: np.ndarray, 
+                               budget: float, risk_free: float, weight_rf: float,
+                               days: int = 252, simulations: int = 10000) -> Dict:
+    """
+    Monte Carlo Simulation with Scenario Analysis
+    Shows: Best 5%, 25th percentile, median, average, worst cases
+    
+    Mathematical Foundation:
+    dS_t = μS_t dt + σS_t dW_t  (Geometric Brownian Motion)
+    """
+    print(f"\n🎲 Running Monte Carlo Simulation ({simulations:,} paths)...")
+    print(f"   Mathematical Model: Geometric Brownian Motion (GBM)")
+    print(f"   Time Horizon: {days} trading days (1 year)")
+    print(f"   Portfolio: {100*(1-weight_rf):.1f}% Risky + {100*weight_rf:.1f}% Risk-Free")
+    
+    dt = 1.0 / days  # Daily time step
+    
+    # Calculate portfolio-level parameters (risky portion only)
+    if np.sum(weights) > 0:
+        risky_weights = weights / np.sum(weights)  # Normalize risky weights
+        port_mu = float(np.dot(risky_weights, mu))
+        port_var = float(np.dot(risky_weights, Sigma @ risky_weights))
+        port_vol = np.sqrt(port_var)
+    else:
+        # 100% risk-free
+        port_mu = risk_free
+        port_vol = 0
+        risky_weights = weights
+    
+    print(f"   Risky Portfolio Expected Return: {port_mu:.2%}")
+    print(f"   Risky Portfolio Volatility: {port_vol:.2%}")
+    
+    final_values = []
+    
+    for _ in range(simulations):
+        if port_vol > 0:
+            # Generate random shocks (Wiener process increments)
+            daily_shocks = np.random.normal(0, 1, days) * np.sqrt(dt)
+            
+            # GBM solution for risky portion
+            daily_returns = (port_mu - 0.5 * port_var) * dt + port_vol * daily_shocks
+            risky_cumulative = np.prod(1 + daily_returns)
+        else:
+            # 100% risk-free: deterministic growth
+            risky_cumulative = np.exp(risk_free)
+        
+        # Combine risky + risk-free portions
+        # Total return = w_rf * Rf + (1-w_rf) * R_risky
+        total_return = weight_rf * np.exp(risk_free) + (1 - weight_rf) * risky_cumulative
+        final_value = budget * total_return
+        final_values.append(final_value)
+    
+    final_values = np.array(final_values)
+    
+    # Calculate Scenario Percentiles
+    scenarios = {
+        'best_5%': np.percentile(final_values, 95),
+        'q3_75%': np.percentile(final_values, 75),
+        'median_50%': np.percentile(final_values, 50),
+        'q1_25%': np.percentile(final_values, 25),
+        'worst_5%': np.percentile(final_values, 5),
+        'mean': np.mean(final_values),
+        'std': np.std(final_values),
+        'prob_profit': np.sum(final_values > budget) / simulations,
+        'all_values': final_values
+    }
+    
+    # Calculate VaR and CVaR
+    var_95 = budget - scenarios['worst_5%']
+    worst_5pct = final_values[final_values <= scenarios['worst_5%']]
+    cvar_95 = budget - np.mean(worst_5pct) if len(worst_5pct) > 0 else var_95
     
     print(f"\n{'='*60}")
-    print(f"🎯 TANGENCY PORTFOLIO (Maximum Sharpe Ratio)")
+    print(f"📊 MONTE CARLO SCENARIO ANALYSIS (1-Year Horizon)")
     print(f"{'='*60}")
-    print(f"Expected Return:  {tangency_ret:>10.2%}")
-    print(f"Volatility:       {tangency_vol:>10.2%}")
-    print(f"Sharpe Ratio:     {tangency_sharpe:>10.2f}")
-    print(f"\n{'Stock':<10} {'Weight':<12} {'Allocation':<15}")
-    print("-" * 40)
-    for i in range(n):
-        if tangency_weights[i] > 0.001:
-            alloc = tangency_weights[i] * budget
-            print(f"{stocks[i]:<10} {tangency_weights[i]:>11.2%} ${alloc:>12,.2f}")
+    print(f"Simulations:    {simulations:,} paths")
+    print(f"Initial Budget: ${budget:,.2f}")
+    print(f"\n📈 UPSIDE SCENARIOS:")
+    print(f"   Best 5% Case:     ${scenarios['best_5%']:>12,.2f}  (+{(scenarios['best_5%']/budget-1)*100:>6.1f}%)")
+    print(f"   75th Percentile:  ${scenarios['q3_75%']:>12,.2f}  (+{(scenarios['q3_75%']/budget-1)*100:>6.1f}%)")
+    print(f"\n📊 CENTRAL TENDENCY:")
+    print(f"   Median (50%):     ${scenarios['median_50%']:>12,.2f}  (+{(scenarios['median_50%']/budget-1)*100:>6.1f}%)")
+    print(f"   Mean (Average):   ${scenarios['mean']:>12,.2f}  (+{(scenarios['mean']/budget-1)*100:>6.1f}%)")
+    print(f"\n📉 DOWNSIDE SCENARIOS:")
+    print(f"   25th Percentile:  ${scenarios['q1_25%']:>12,.2f}  ({(scenarios['q1_25%']/budget-1)*100:>6.1f}%)")
+    print(f"   Worst 5% Case:    ${scenarios['worst_5%']:>12,.2f}  ({(scenarios['worst_5%']/budget-1)*100:>6.1f}%)")
+    print(f"\n⚠️  RISK METRICS:")
+    print(f"   VaR (95%):        ${var_95:>12,.2f}  (Max loss in worst 5%)")
+    print(f"   CVaR (95%):       ${cvar_95:>12,.2f}  (Avg loss in worst 5%)")
+    print(f"   Probability Profit: {scenarios['prob_profit']:.2%}")
+    print(f"   Return Std Dev:   {scenarios['std']/budget:.2%}")
     print(f"{'='*60}")
     
-    final_weights_risky = np.zeros(n)
-    weight_risk_free = 0.0
-    strategy = ""
+    # Text-based distribution histogram
+    print(f"\n📊 RETURN DISTRIBUTION (Text Histogram):")
+    print(f"{'='*60}")
     
-    # 2. Logic Branching based on Target Return
-    if target_return < tangency_ret:
-        strategy = "CML (Risk-Free + Tangency)"
-        
-        if tangency_ret - risk_free == 0:
-            w_risky = 0
-        else:
-            w_risky = (target_return - risk_free) / (tangency_ret - risk_free)
-        
-        w_risky = max(0, min(1, w_risky))
-        weight_risk_free = 1.0 - w_risky
-        final_weights_risky = w_risky * tangency_weights
-        
-        print(f"\n📉 Target ({target_return:.2%}) < Tangency ({tangency_ret:.2%})")
-        print(f"   → Using Capital Market Line")
-        print(f"   → Risk-Free: {weight_risk_free:.2%}, Risky: {w_risky:.2%}")
-        
-    else:
-        strategy = "Efficient Frontier (Constrained)"
-        weight_risk_free = 0.0
-        
-        z = cp.Variable(n, boolean=True) 
-        w = cp.Variable(n)
-        
-        M = 1.0 
-        constraints = [
-            mu @ w == target_return,
-            cp.sum(w) == 1,
-            w >= 0,
-            w <= M * z,
-            cp.sum(z) <= max_k
-        ]
-        
-        prob = cp.Problem(cp.Minimize(cp.quad_form(w, Sigma)), constraints)
-        
-        try:
-            prob.solve(solver=cp.CBC, verbose=False) 
-            
-            if prob.status not in ['optimal', 'optimal_inaccurate']:
-                print("⚠ MIP Solver not available, relaxing integer constraint.")
-                constraints_relaxed = [
-                    mu @ w == target_return,
-                    cp.sum(w) == 1,
-                    w >= 0,
-                ]
-                prob_relaxed = cp.Problem(cp.Minimize(cp.quad_form(w, Sigma)), constraints_relaxed)
-                prob_relaxed.solve(solver=cp.SCS, verbose=False)
-                
-                if prob_relaxed.status in ['optimal', 'optimal_inaccurate']:
-                    final_weights_risky = w.value
-                    top_k_idx = np.argsort(final_weights_risky)[-max_k:]
-                    mask = np.zeros(n)
-                    mask[top_k_idx] = 1
-                    final_weights_risky = final_weights_risky * mask
-                    if final_weights_risky.sum() > 0:
-                        final_weights_risky = final_weights_risky / final_weights_risky.sum()
-                else:
-                    print(f"❌ Relaxed optimization failed: {prob_relaxed.status}")
-                    final_weights_risky = tangency_weights
-            else:
-                final_weights_risky = w.value
-                final_weights_risky[final_weights_risky < 1e-4] = 0
-                print(f"\n📈 Target ({target_return:.2%}) >= Tangency ({tangency_ret:.2%})")
-                print(f"   → Using Constrained Efficient Frontier")
-                print(f"   → Active Stocks: {np.sum(final_weights_risky > 0)}")
-        except Exception as e:
-            print(f"❌ Solver Error: {e}")
-            final_weights_risky = tangency_weights
-
-    risky_budget = budget * (1 - weight_risk_free)
-    dollar_amounts = final_weights_risky * risky_budget
-    shares = np.floor(dollar_amounts / prices).astype(int)
+    returns_pct = (final_values / budget - 1) * 100  # Convert to percentage
+    bins = np.linspace(np.percentile(returns_pct, 1), np.percentile(returns_pct, 99), 20)
+    hist, bin_edges = np.histogram(returns_pct, bins=bins)
+    max_count = np.max(hist)
     
-    return {
-        'weights_risky': final_weights_risky,
-        'weight_rf': weight_risk_free,
-        'strategy': strategy,
-        'shares': shares,
-        'tangency_ret': tangency_ret,
-        'tangency_sharpe': tangency_sharpe,
-        'tangency_weights': tangency_weights
-    }
-
-
-def solve_dp_portfolio(mu, Sigma, prices, risk_free, target_return, max_k, budget, stocks):
-    """
-    Discrete Optimization (Recursive Search)
-    """
-    n = len(mu)
-    best_solution = None
-    best_diff = float('inf')
-    best_vol = float('inf')
+    for i in range(len(hist)):
+        if hist[i] > 0:
+            bar_len = int(40 * hist[i] / max_count)
+            bin_mid = (bin_edges[i] + bin_edges[i+1]) / 2
+            print(f"   {bin_mid:>+6.1f}% │ {'█' * bar_len} {hist[i]}")
     
-    est_tangency_ret = float(mu @ (np.ones(n)/n))
-    use_risk_free = target_return < est_tangency_ret
+    print(f"{'='*60}")
     
-    if use_risk_free:
-        target_risky_return = est_tangency_ret 
-        print(f"\n📉 DP: Target < Est. Tangency. Using Risk-Free Mix.")
-    else:
-        target_risky_return = target_return
-        print(f"\n📈 DP: Target >= Est. Tangency. Targeting Frontier.")
-
-    def search(idx, current_shares, current_cost, current_count):
-        nonlocal best_solution, best_diff, best_vol
-        
-        if current_cost > budget or current_count > max_k:
-            return
-
-        if idx == n:
-            if current_cost == 0 or np.sum(current_shares) == 0:
-                return
-                
-            shares_arr = np.array(current_shares)
-            values = shares_arr * prices
-            total_val = np.sum(values)
-            if total_val == 0: return
-            
-            w = values / total_val
-            port_ret = float(mu @ w)
-            port_vol = float(np.sqrt(w @ Sigma @ w))
-            
-            if use_risk_free:
-                score = (port_ret - risk_free) / port_vol
-                current_metric = -score 
-                diff = 0
-            else:
-                diff = abs(port_ret - target_risky_return)
-                current_metric = diff
-            
-            is_better = False
-            if best_solution is None:
-                is_better = True
-            elif use_risk_free:
-                if current_metric < best_diff:
-                    is_better = True
-            else:
-                if diff < best_diff or (diff == best_diff and port_vol < best_vol):
-                    is_better = True
-            
-            if is_better:
-                best_diff = current_metric
-                best_vol = port_vol if not use_risk_free else best_vol
-                best_solution = {
-                    'shares': shares_arr,
-                    'weights': w,
-                    'ret': port_ret,
-                    'vol': port_vol
-                }
-            return
-
-        max_possible = int((budget - current_cost) / prices[idx])
-        limit = min(max_possible, 50)
-        
-        start_share = 0
-        if current_count >= max_k:
-            start_share = 0
-            limit = 0
-            
-        for s in range(start_share, limit + 1):
-            new_count = current_count + (1 if s > 0 else 0)
-            if new_count > max_k and s > 0: 
-                continue
-                
-            search(idx + 1, 
-                   current_shares + [s], 
-                   current_cost + s * prices[idx], 
-                   new_count)
-
-    search(0, [], 0, 0)
-    
-    if best_solution is None:
-        return {'weights_risky': np.ones(n)/n, 'weight_rf': 0, 'shares': np.ones(n), 
-                'strategy': 'Fallback', 'tangency_ret': 0, 'tangency_sharpe': 0, 'tangency_weights': np.ones(n)/n}
-
-    final_weight_rf = 0.0
-    final_weights_risky = best_solution['weights']
-    
-    if use_risk_free:
-        actual_tangency_ret = best_solution['ret']
-        if actual_tangency_ret - risk_free == 0:
-            w_risky = 0
-        else:
-            w_risky = (target_return - risk_free) / (actual_tangency_ret - risk_free)
-        final_weight_rf = 1.0 - w_risky
-        final_weights_risky = w_risky * best_solution['weights']
-        strategy = "DP CML (Risk-Free + Tangency)"
-    else:
-        strategy = "DP Efficient Frontier"
-
-    risky_budget = budget * (1 - final_weight_rf)
-    final_shares = np.floor((final_weights_risky * budget) / prices).astype(int)
-
-    return {
-        'weights_risky': final_weights_risky,
-        'weight_rf': final_weight_rf,
-        'strategy': strategy,
-        'shares': final_shares,
-        'tangency_ret': best_solution['ret'] if use_risk_free else target_return,
-        'tangency_sharpe': 0,
-        'tangency_weights': best_solution['weights'] if use_risk_free else np.zeros(n)
-    }
+    return scenarios
 
 
 def main():
     # Configuration
-    global stocks
     stocks = sorted(['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA'])
     risk_free_rate = 0.04
     budget = 100000
-    max_k = 3
-    target_return_input = 0.15
-    market_ticker = '^GSPC'  # S&P 500 as market benchmark
+    target_return = 0.12  # Optional: Set to None for 100% tangency
+    market_ticker = '^GSPC'
 
     print(f"\n{'='*60}")
-    print(f"PORTFOLIO OPTIMIZATION WITH CAPM EXPECTED RETURNS")
+    print(f"🎯 TANGENCY PORTFOLIO WITH SCENARIO ANALYSIS")
     print(f"{'='*60}")
     print(f"Stocks: {', '.join(stocks)}")
     print(f"Budget: ${budget:,.0f}")
-    print(f"Max Stocks (K): {max_k}")
-    print(f"Target Return: {target_return_input:.2%}")
+    print(f"Target Return: {target_return:.2%}" if target_return else "Target Return: None (100% Tangency)")
     print(f"Risk-Free Rate: {risk_free_rate:.2%}")
     print(f"Market Benchmark: {market_ticker}")
     print(f"{'='*60}\n")
@@ -434,59 +395,93 @@ def main():
     gc.collect()
     print(f"✓ Data cleanup complete")
 
-    print(f"\n{'='*60}")
-    print(f"OPTIMIZATION SETTINGS")
-    print(f"{'='*60}")
-    print(f"Budget: ${budget:,.0f}")
-    print(f"Max Stocks (K): {max_k}")
-    print(f"Target Return: {target_return_input:.2%}")
-    print(f"Risk-Free Rate: {risk_free_rate:.2%}")
-    print(f"{'='*60}\n")
-
-    # 6. Run CVXPY
-    print("🔄 Running CVXPY (Continuous + MIP)...")
-    res_cvx = solve_cvxpy_portfolio(mu, Sigma, prices, risk_free_rate, target_return_input, max_k, budget, stocks)
+    # 6. Solve Tangency Portfolio (with optional CML allocation)
+    print("\n🔄 Solving Tangency Portfolio...")
+    portfolio = solve_tangency_portfolio(mu, Sigma, risk_free_rate, budget, stocks, target_return)
     
-    # 7. Run DP
-    print("\n🔄 Running DP (Discrete Shares)...")
-    res_dp = solve_dp_portfolio(mu, Sigma, prices, risk_free_rate, target_return_input, max_k, budget, stocks)
-
-    # 8. Display Final Portfolio Results
-    def print_results(name, res):
-        print(f"\n{'='*60}")
-        print(f"📋 {name} FINAL PORTFOLIO")
-        print(f"{'='*60}")
-        print(f"Strategy: {res['strategy']}")
-        print(f"Risk-Free Weight: {res['weight_rf']:.2%}")
-        print(f"Risky Asset Weight: {1 - res['weight_rf']:.2%}")
-        
-        print(f"\n{'Stock':<10} {'Weight':<12} {'Shares':<10} {'Price':<12} {'Value':<12}")
-        print("-" * 56)
-        
-        total_stock_value = 0
-        for i, stock in enumerate(stocks):
-            if res['weights_risky'][i] > 0.001 or res['shares'][i] > 0:
-                value = res['shares'][i] * prices[i]
-                total_stock_value += value
-                print(f"{stock:<10} {res['weights_risky'][i]:>11.2%} {res['shares'][i]:>8} ${prices[i]:>10.2f} ${value:>10,.2f}")
-        
-        print("-" * 56)
-        print(f"Total Invested in Stocks: ${total_stock_value:,.2f}")
-        print(f"Cash Remaining (Risk-Free): ${budget - total_stock_value:,.2f}")
-        print(f"{'='*60}")
-
-    print_results("CVXPY", res_cvx)
-    print_results("DP", res_dp)
-
-    # 9. Summary Comparison
+    # 7. Calculate Shares
+    weights = portfolio['final_weights']
+    weight_rf = portfolio['weight_rf']
+    dollar_amounts = weights * budget
+    shares = np.floor(dollar_amounts / prices).astype(int)
+    invested_value = np.sum(shares * prices)
+    cash_remaining = budget - invested_value + (weight_rf * budget - np.sum(weights * budget - shares * prices))
+    
+    # 8. Run Monte Carlo Scenario Analysis
+    scenarios = run_monte_carlo_scenarios(
+        weights=portfolio['tangency_weights'],  # Use pure tangency for simulation
+        mu=mu, 
+        Sigma=Sigma, 
+        budget=budget,
+        risk_free=risk_free_rate,
+        weight_rf=weight_rf
+    )
+    
+    # 9. Display Final Portfolio
     print(f"\n{'='*60}")
-    print(f"📊 METHOD COMPARISON")
+    print(f"📋 FINAL PORTFOLIO ALLOCATION")
     print(f"{'='*60}")
-    print(f"{'Metric':<30} {'CVXPY':<15} {'DP':<15}")
-    print("-" * 60)
-    print(f"{'Risk-Free Weight':<30} {res_cvx['weight_rf']:>13.2%} {res_dp['weight_rf']:>13.2%}")
-    print(f"{'Active Stocks':<30} {np.sum(res_cvx['weights_risky'] > 0):>13.0f} {np.sum(res_dp['weights_risky'] > 0):>13.0f}")
-    print(f"{'Strategy':<30} {res_cvx['strategy']:>15} {res_dp['strategy']:>15}")
+    print(f"Strategy: {portfolio['strategy']}")
+    print(f"Risk-Free Proportion: {weight_rf:.2%}")
+    print(f"Risky Asset Proportion: {1-weight_rf:.2%}")
+    
+    print(f"\n{'Stock':<10} {'Weight':<12} {'Shares':<10} {'Price':<12} {'Value':<12}")
+    print("-" * 56)
+    
+    total_stock_value = 0
+    for i, stock in enumerate(stocks):
+        if weights[i] > 0.001 or shares[i] > 0:
+            value = shares[i] * prices[i]
+            total_stock_value += value
+            print(f"{stock:<10} {weights[i]:>11.2%} {shares[i]:>8} ${prices[i]:>10.2f} ${value:>10,.2f}")
+    
+    print("-" * 56)
+    print(f"Total Invested in Stocks: ${total_stock_value:,.2f}")
+    print(f"Cash (Risk-Free Asset):   ${budget - total_stock_value:,.2f}")
+    print(f"{'='*60}")
+    
+    # 10. Scenario Summary Table
+    print(f"\n{'='*60}")
+    print(f"📊 SCENARIO SUMMARY TABLE")
+    print(f"{'='*60}")
+    print(f"{'Scenario':<20} {'Portfolio Value':>15} {'Return vs Budget':>18}")
+    print("-" * 56)
+    
+    scenario_labels = [
+        ('Best 5% (95th pct)', 'best_5%'),
+        ('75th Percentile', 'q3_75%'),
+        ('Median (50%)', 'median_50%'),
+        ('Mean (Average)', 'mean'),
+        ('25th Percentile', 'q1_25%'),
+        ('Worst 5% (5th pct)', 'worst_5%'),
+    ]
+    
+    for label, key in scenario_labels:
+        value = scenarios[key]
+        ret_pct = (value / budget - 1) * 100
+        sign = '+' if ret_pct >= 0 else ''
+        print(f"{label:<20} ${value:>14,.2f} {sign}{ret_pct:>16.1f}%")
+    
+    print("-" * 56)
+    print(f"Probability of Profit: {scenarios['prob_profit']:.2%}")
+    print(f"VaR (95%): ${budget - scenarios['worst_5%']:,.2f}")
+    print(f"{'='*60}")
+    
+    # 11. Mathematical Finance Summary
+    print(f"\n{'='*60}")
+    print(f"📐 MATHEMATICAL FOUNDATIONS")
+    print(f"{'='*60}")
+    print(f"1. Expected Returns: CAPM")
+    print(f"   E[Rᵢ] = Rf + βᵢ × (E[Rm] - Rf)")
+    print(f"\n2. Optimization: Mean-Variance (Markowitz)")
+    print(f"   max (w'μ - Rf) / √(w'Σw)  s.t.  w'1 = 1, w ≥ 0")
+    print(f"\n3. Capital Market Line (CML)")
+    print(f"   E[Rp] = Rf + [(E[Rt]-Rf)/σt] × σp")
+    print(f"\n4. Risk Simulation: Geometric Brownian Motion")
+    print(f"   dSₜ = μSₜdt + σSₜdWₜ")
+    print(f"\n5. Scenario Analysis: Percentile-based outcomes")
+    print(f"   Best 5% = 95th percentile of simulated returns")
+    print(f"   Worst 5% = 5th percentile (VaR threshold)")
     print(f"{'='*60}\n")
 
 
