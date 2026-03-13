@@ -128,10 +128,7 @@ def get_board_lot(stock: str) -> int:
 
 
 def get_current_prices(stocks: list) -> Dict[str, float]:
-    """
-    🔧 FIX: Get current prices for each stock individually
-    This ensures correct price for each stock (no alignment issues)
-    """
+    """Get current prices for each stock individually"""
     print(f"\n📥 Fetching current prices...")
     prices = {}
     
@@ -140,7 +137,6 @@ def get_current_prices(stocks: list) -> Dict[str, float]:
             ticker = yf.Ticker(stock)
             info = ticker.info
             
-            # Try multiple price fields in order of preference
             price = info.get('currentPrice')
             if price is None or price == 0:
                 price = info.get('previousClose')
@@ -151,7 +147,6 @@ def get_current_prices(stocks: list) -> Dict[str, float]:
                 prices[stock] = float(price)
                 print(f"  ✓ {stock:<15} ${price:>10.2f}")
             else:
-                # Fallback: download recent data
                 data = yf.download(stock, period='5d', progress=False)
                 if isinstance(data.columns, pd.MultiIndex):
                     close_col = 'Close' if 'Close' in data.columns.get_level_values(0) else data.columns[0][0]
@@ -238,11 +233,16 @@ def solve_efficient_frontier_target(mu: np.ndarray, Sigma: np.ndarray, risk_free
 
 def select_top_k_with_covariance(mu: np.ndarray, Sigma: np.ndarray, risk_free: float,
                                   stocks: list, max_k: Optional[int] = None) -> Tuple[list, np.ndarray, np.ndarray, list]:
-    """Forward stepwise selection with covariance"""
+    """Forward stepwise selection with covariance - RESPECTS max_k"""
     n = len(mu)
     
+    # ✅ FIX: Handle max_k = None or max_k >= n
     if max_k is None or max_k >= n:
+        print(f"\n📊 No stock limit (using all {n} stocks)")
         return stocks, mu, Sigma, list(range(n))
+    
+    print(f"\n📊 FORWARD STEPWISE SELECTION (Top {max_k} with Covariance)")
+    print(f"{'='*60}")
     
     selected_indices = []
     remaining_indices = list(range(n))
@@ -269,10 +269,14 @@ def select_top_k_with_covariance(mu: np.ndarray, Sigma: np.ndarray, risk_free: f
         
         selected_indices.append(best_candidate)
         remaining_indices.remove(best_candidate)
+        print(f"  Step {step}: Added {stocks[best_candidate]} (Sharpe: {best_sharpe:.4f})")
     
     final_mu = mu[selected_indices]
     final_Sigma = Sigma[np.ix_(selected_indices, selected_indices)]
     final_stocks = [stocks[i] for i in selected_indices]
+    
+    print(f"✓ Selected {len(final_stocks)} stocks: {', '.join(final_stocks)}")
+    print(f"{'='*60}")
     
     return final_stocks, final_mu, final_Sigma, selected_indices
 
@@ -428,15 +432,19 @@ def main():
     risk_free_rate = 0.04
     budget = 100000
     target_return = 0.12
-    max_k = None  # No limit for this demo
+    max_k = 6  # 🔑 MAX STOCKS LIMIT
     market_ticker = '^GSPC'
+
+    # ✅ FIX: Compute formatted strings before f-string
+    target_display = f"{target_return:.0%}" if target_return is not None else 'None'
+    max_k_display = f"{max_k}" if max_k is not None else 'Unlimited'
 
     print(f"\n{'='*70}")
     print(f"PORTFOLIO OPTIMIZATION (US + HK STOCKS)")
     print(f"{'='*70}")
     print(f"Stocks: {', '.join(all_stocks)}")
-    print(f"Budget: ${budget:,.0f} USD | Target: {target_return:.0%} | Rf: {risk_free_rate:.0%}")
-    print(f"Max Stocks: {max_k if max_k else 'Unlimited'} | Market: {market_ticker}")
+    print(f"Budget: ${budget:,.0f} USD | Target: {target_display} | Rf: {risk_free_rate:.0%}")
+    print(f"Max Stocks (K): {max_k_display} | Market: {market_ticker}")
     print(f"{'='*70}\n")
 
     # 1. Get Historical Returns
@@ -452,14 +460,15 @@ def main():
     # 4. Calculate Covariance
     Sigma = returns.cov().values * 252
     
-    # 🔧 5. Get Current Prices (FIXED - individual fetch)
+    # 5. Get Current Prices
     prices_dict = get_current_prices(stocks)
     
     # Cleanup
     del returns
     gc.collect()
 
-    # 6. Stock Selection
+    # 6. Stock Selection WITH max_k
+    print(f"\n🎯 Selecting top {max_k} stocks by covariance-aware Sharpe...")
     sel_stocks, sel_mu, sel_Sigma, sel_idx = select_top_k_with_covariance(mu, Sigma, risk_free_rate, stocks, max_k)
     
     # 7. Solve Portfolio
@@ -488,7 +497,9 @@ def main():
     print(f"Return: {portfolio['final_return']:.2%} | Vol: {portfolio['final_vol']:.2%} | Sharpe: {portfolio['final_sharpe']:.4f}")
     print(f"Risk-Free: {portfolio['weight_rf']:.0%} | Active Stocks: {portfolio['active_stocks']}")
     print(f"{'-'*70}")
-    print(f"{'Stock':<15} {'Weight':>10} {'Shares':>10}{'Price':>14} {'Value(USD)':>14} {'Div':>8}")
+    
+    # ✅ FIX: Added 'Lot' column header back
+    print(f"{'Stock':<15} {'Weight':>10} {'Shares':>10} {'Lot':>8} {'Price':>14} {'Value(USD)':>14} {'Div':>8}")
     print(f"{'-'*70}")
     
     total_value = 0
@@ -498,11 +509,12 @@ def main():
             total_value += value
             div = dividend_yields.get(stock, 0.0)
             currency = 'HKD' if stock.endswith('.HK') else 'USD'
-            lot = board_lots[i]
+            lot = board_lots[i]  # ✅ FIX: Get board lot size
             price = prices_dict.get(stock, 0)
             price_display = f"${price:.2f} {currency}"
             
-            print(f"{stock:<15} {weights[i]:>9.2%} {shares[i]:>10} {price_display:>14} ${value:>12,.2f} {div:>7.2%}")
+            # ✅ FIX: Print lot size in output
+            print(f"{stock:<15} {weights[i]:>9.2%} {shares[i]:>10} {lot:>8} {price_display:>14} ${value:>12,.2f} {div:>7.2%}")
     
     print(f"{'-'*70}")
     print(f"Total Stocks: ${total_value:,.2f} USD | Cash (RF): ${budget - total_value:,.2f} USD")
@@ -534,7 +546,8 @@ def main():
         for stock in hk_stocks_in_portfolio:
             idx = stocks.index(stock)
             lot = board_lots[idx]
-            print(f"{stock}: {shares[idx]} shares = {shares[idx] // lot} board lots (lot size: {lot})")
+            lots_count = shares[idx] // lot if lot > 0 else 0
+            print(f"{stock}: {shares[idx]} shares = {lots_count} board lots (lot size: {lot})")
         print(f"{'='*70}\n")
     else:
         print()
