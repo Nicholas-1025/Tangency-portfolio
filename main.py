@@ -9,7 +9,9 @@ np.random.seed(42)
 
 
 def get_returns(stocks: list, period: str = '2y') -> pd.DataFrame:
-    """Download historical data and return cleaned returns"""
+    """Download historical data (supports US + HK stocks)"""
+    print(f"📥 Downloading data for {len(stocks)} stocks...")
+    
     data = yf.download(stocks, period=period, threads=False, progress=False, auto_adjust=False)
     
     if isinstance(data.columns, pd.MultiIndex):
@@ -20,13 +22,62 @@ def get_returns(stocks: list, period: str = '2y') -> pd.DataFrame:
     if isinstance(adj_close, pd.Series):
         adj_close = adj_close.to_frame()
     
-    adj_close = adj_close.ffill().dropna(axis=1, thresh=len(adj_close) * 0.8)
-    return adj_close.pct_change().dropna()
+    adj_close = adj_close.ffill().dropna(axis=1, thresh=len(adj_close) * 0.6)
+    returns = adj_close.pct_change().dropna()
+    
+    print(f"✓ Data: {len(returns)} days, {len(returns.columns)} stocks")
+    return returns
 
 
-def get_capm_returns(stocks: list, returns: pd.DataFrame, risk_free: float = 0.04, 
+def get_dividend_yield(stocks: list) -> Dict[str, float]:
+    """
+    Get trailing dividend yield for each stock
+    Supports US (.US) and HK (.HK) stocks
+    """
+    print(f"\n📊 Fetching dividend data...")
+    dividend_yields = {}
+    
+    for stock in stocks:
+        try:
+            ticker = yf.Ticker(stock)
+            info = ticker.info
+            
+            # Get dividend yield (already annualized %)
+            div_yield = info.get('trailingAnnualDividendYield', 0)
+            
+            # Fallback: calculate from dividend rate and price
+            if div_yield == 0 or div_yield is None:
+                div_rate = info.get('trailingAnnualDividendRate', 0)
+                price = info.get('currentPrice', info.get('previousClose', 0))
+                if div_rate > 0 and price > 0:
+                    div_yield = div_rate / price
+            
+            dividend_yields[stock] = div_yield if div_yield else 0.0
+            
+        except Exception as e:
+            dividend_yields[stock] = 0.0
+    
+    # Display dividend info
+    print(f"{'Stock':<15} {'Div Yield':>12}")
+    print("-" * 30)
+    for stock, yield_val in dividend_yields.items():
+        print(f"{stock:<15} {yield_val:>11.2%}")
+    print("-" * 30)
+    
+    return dividend_yields
+
+
+def get_capm_returns(stocks: list, returns: pd.DataFrame, risk_free: float = 0.04,
+                     dividend_yields: Dict[str, float] = None,
                      market_ticker: str = '^GSPC', period: str = '2y') -> pd.Series:
-    """CAPM Expected Returns"""
+    """
+    CAPM Expected Returns WITH DIVIDEND YIELD
+    
+    Total Expected Return = CAPM Price Return + Dividend Yield
+    E[R_total] = Rf + β × (E[Rm] - Rf) + Dividend_Yield
+    """
+    print(f"\n📥 Downloading market data ({market_ticker})...")
+    
     market_data = yf.download(market_ticker, period=period, threads=False, progress=False, auto_adjust=False)
     
     if isinstance(market_data.columns, pd.MultiIndex):
@@ -46,14 +97,30 @@ def get_capm_returns(stocks: list, returns: pd.DataFrame, risk_free: float = 0.0
     market_excess = market_mean - risk_free
     
     capm_mu = {}
+    print(f"\n📊 EXPECTED RETURNS (CAPM + Dividends):")
+    print(f"{'Stock':<15} {'Beta':>8} {'CAPM':>10} {'Div':>8} {'Total':>10}")
+    print("-" * 55)
+    
     for stock in stocks:
         if stock in returns_aligned.columns:
             cov = float(returns_aligned[stock].cov(market_returns) * 252)
             var = float(market_returns.var() * 252)
             beta = cov / var if var > 0 else 1.0
-            capm_mu[stock] = risk_free + beta * market_excess
         else:
-            capm_mu[stock] = risk_free + market_excess
+            beta = 1.0
+        
+        # CAPM price return
+        capm_price_return = risk_free + beta * market_excess
+        
+        # Add dividend yield
+        div_yield = dividend_yields.get(stock, 0.0) if dividend_yields else 0.0
+        total_return = capm_price_return + div_yield
+        
+        capm_mu[stock] = total_return
+        
+        print(f"{stock:<15} {beta:>7.2f} {capm_price_return:>9.2%} {div_yield:>7.2%} {total_return:>9.2%}")
+    
+    print("-" * 55)
     
     return pd.Series(capm_mu)
 
@@ -171,7 +238,6 @@ def solve_portfolio(mu: np.ndarray, Sigma: np.ndarray, risk_free: float, budget:
     """Solve portfolio with target return logic"""
     n = len(mu)
     
-    # Validate Sigma
     if Sigma.ndim == 1:
         Sigma = Sigma.reshape(1, 1)
     if Sigma.shape != (n, n):
@@ -183,10 +249,8 @@ def solve_portfolio(mu: np.ndarray, Sigma: np.ndarray, risk_free: float, budget:
     if min_eig < 1e-8:
         Sigma = Sigma + (1e-6 - min_eig) * np.eye(n)
     
-    # Tangency Portfolio
     tangency_weights, tangency_sharpe, tangency_return, tangency_vol = solve_tangency_sharpe(mu, Sigma, risk_free)
     
-    # Determine Strategy
     weight_rf = 0.0
     final_weights = tangency_weights.copy()
     final_return = tangency_return
@@ -210,7 +274,6 @@ def solve_portfolio(mu: np.ndarray, Sigma: np.ndarray, risk_free: float, budget:
     else:
         strategy = "Tangency (Max Sharpe)"
     
-    # Map back to original stocks
     if original_stocks is not None and original_indices is not None:
         full_weights = np.zeros(len(original_stocks))
         for i, idx in enumerate(original_indices):
@@ -234,7 +297,7 @@ def solve_portfolio(mu: np.ndarray, Sigma: np.ndarray, risk_free: float, budget:
 
 def run_monte_carlo(weights: np.ndarray, mu: np.ndarray, Sigma: np.ndarray, 
                     budget: float, risk_free: float, weight_rf: float,
-                    days: int = 252, simulations: int = 100000) -> Dict:
+                    days: int = 252, simulations: int = 5000) -> Dict:
     """Monte Carlo simulation"""
     dt = 1.0 / days
     
@@ -273,48 +336,63 @@ def run_monte_carlo(weights: np.ndarray, mu: np.ndarray, Sigma: np.ndarray,
 
 
 def main():
-    # Configuration
+    # Configuration - SUPPORTS US AND HK STOCKS!
+    # US Stocks: 'AAPL', 'MSFT', etc.
+    # HK Stocks: '0700.HK' (Tencent), '9988.HK' (Alibaba), '0005.HK' (HSBC)
     all_stocks = sorted([
-    "MSFT",  # Microsoft
-    "AAPL",  # Apple
-    "GOOGL", # Alphabet
-    "AMZN",  # Amazon
-    "NVDA",  # Nvidia
-    "META",  # Meta Platforms
-    "JPM",   # JPMorgan Chase
-    "V",     # Visa 
-    "UNH",   # UnitedHealth
-    "JNJ",   # Johnson & Johnson
+    # 🇺🇸 美股 (12檔)
+    "MSFT",   # Microsoft - 雲端與AI
+    "AAPL",   # Apple - 消費電子
+    "NVDA",   # Nvidia - AI晶片
+    "GOOGL",  # Alphabet - 搜尋廣告
+    "AMZN",   # Amazon - 電商雲端
+    "META",   # Meta - 社群媒體
+    "JPM",    # JPMorgan - 銀行
+    "V",      # Visa - 支付網路
+    "LLY",    # Eli Lilly - 生技醫療
+    "BRK.B",  # Berkshire Hathaway - 多元控股
+    "KO",     # Coca-Cola - 防禦型消費
+    "XOM",    # Exxon Mobil - 能源
 
-    "XOM",   # Exxon Mobil 
-    "PG",    # Procter & Gamble
-    "HD",    # Home Depot 
-    "KO",    # Coca-Cola
-    "WMT",   # Walmart 
-    "LLY",   # Eli Lilly 
-    "AVGO",  # Broadcom
-    "CRM",   # Salesforce 
-    "HD"     # Home Depot 
+    # 🇭🇰 港股 (8檔)
+    "0700.HK",  # 騰訊 Tencent - 科技龍頭
+    "1810.HK",  # 小米 Xiaomi - 消費電子/EV
+    "3690.HK",  # 美團 Meituan - 本地生活
+    "1299.HK",  # AIA - 保險龍頭
+    "0005.HK",  # 匯豐 HSBC - 銀行
+    "0883.HK",  # 中海油 CNOOC - 能源
+    "0941.HK",  # 中國移動 China Mobile - 電訊
+    "0388.HK",  # 港交所 HKEX - 金融基建
 ])
     risk_free_rate = 0.04
     budget = 100000
-    target_return = 0.18
+    target_return = 0.12
     max_k = 6
+    market_ticker = '^GSPC'  # Use ^HSI for HK market benchmark
 
     print(f"\n{'='*60}")
-    print(f"PORTFOLIO OPTIMIZATION (CAPM + Mean-Variance)")
+    print(f"PORTFOLIO OPTIMIZATION (US + HK STOCKS)")
     print(f"{'='*60}")
-    print(f"Stocks: {', '.join(all_stocks)} | Max K: {max_k}")
+    print(f"Stocks: {', '.join(all_stocks)}")
     print(f"Budget: ${budget:,.0f} | Target: {target_return:.0%} | Rf: {risk_free_rate:.0%}")
+    print(f"Max Stocks: {max_k} | Market: {market_ticker}")
     print(f"{'='*60}\n")
 
-    # Get Data
+    # 1. Get Historical Returns
     returns = get_returns(all_stocks)
     stocks = list(returns.columns)
-    mu = get_capm_returns(stocks, returns, risk_free_rate).values
+    
+    # 2. Get Dividend Yields
+    dividend_yields = get_dividend_yield(stocks)
+    
+    # 3. Get CAPM Returns (WITH DIVIDENDS)
+    mu = get_capm_returns(stocks, returns, risk_free_rate, dividend_yields, market_ticker).values
+    
+    # 4. Calculate Covariance
     Sigma = returns.cov().values * 252
     
-    # Get Prices
+    # 5. Get Current Prices
+    print(f"\n📥 Fetching current prices...")
     prices_data = yf.download(stocks, period='5d', threads=False, progress=False, auto_adjust=False)
     if isinstance(prices_data.columns, pd.MultiIndex):
         col = 'Adj Close' if 'Adj Close' in prices_data.columns.get_level_values(0) else 'Close'
@@ -327,18 +405,18 @@ def main():
     del returns, prices_data
     gc.collect()
 
-    # Stock Selection
+    # 6. Stock Selection
     sel_stocks, sel_mu, sel_Sigma, sel_idx = select_top_k_with_covariance(mu, Sigma, risk_free_rate, stocks, max_k)
     
-    # Solve Portfolio
+    # 7. Solve Portfolio
     portfolio = solve_portfolio(sel_mu, sel_Sigma, risk_free_rate, budget, sel_stocks, 
                                  target_return, stocks, sel_idx)
     
-    # Calculate Shares
+    # 8. Calculate Shares
     weights = portfolio['final_weights']
     shares = np.floor((weights * budget) / prices).astype(int)
     
-    # Monte Carlo
+    # 9. Monte Carlo
     mc = run_monte_carlo(weights, mu, Sigma, budget, risk_free_rate, portfolio['weight_rf'])
     
     # Output: Tangency Portfolio
@@ -356,7 +434,7 @@ def main():
     print(f"Return: {portfolio['final_return']:.2%} | Vol: {portfolio['final_vol']:.2%} | Sharpe: {portfolio['final_sharpe']:.4f}")
     print(f"Risk-Free: {portfolio['weight_rf']:.0%} | Active Stocks: {portfolio['active_stocks']}")
     print(f"{'-'*60}")
-    print(f"{'Stock':<10} {'Weight':>10} {'Shares':>10} {'Price':>12} {'Value':>14}")
+    print(f"{'Stock':<15} {'Weight':>10} {'Shares':>10} {'Price':>12} {'Value':>14} {'Div':>8}")
     print(f"{'-'*60}")
     
     total_value = 0
@@ -364,7 +442,8 @@ def main():
         if weights[i] > 0.001 or shares[i] > 0:
             value = shares[i] * prices[i]
             total_value += value
-            print(f"{stock:<10} {weights[i]:>9.2%} {shares[i]:>10} ${prices[i]:>10.2f} ${value:>12,.2f}")
+            div = dividend_yields.get(stock, 0.0)
+            print(f"{stock:<15} {weights[i]:>9.2%} {shares[i]:>10} ${prices[i]:>10.2f} ${value:>12,.2f} {div:>7.2%}")
     
     print(f"{'-'*60}")
     print(f"Total Stocks: ${total_value:,.2f} | Cash (RF): ${budget - total_value:,.2f}")
@@ -376,7 +455,17 @@ def main():
     print(f"Median Value: ${mc['median']:,.2f} | Profit Prob: {mc['prob_profit']:.0%}")
     print(f"VaR (95%): ${mc['var_95']:,.2f} | CVaR (95%): ${mc['cvar_95']:,.2f}")
     print(f"{'='*60}\n")
+    
+    # Output: Dividend Summary
+    print(f"{'='*60}")
+    print(f"DIVIDEND SUMMARY")
+    print(f"{'='*60}")
+    portfolio_div_yield = sum(weights[i] * dividend_yields.get(stock, 0.0) for i, stock in enumerate(stocks))
+    annual_div_income = portfolio_div_yield * total_value
+    print(f"Portfolio Dividend Yield: {portfolio_div_yield:.2%}")
+    print(f"Estimated Annual Dividend Income: ${annual_div_income:,.2f}")
+    print(f"{'='*60}\n")
 
 
 if __name__ == "__main__":
-    main()
+    main() 
