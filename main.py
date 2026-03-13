@@ -7,6 +7,70 @@ from typing import Dict, Optional, List, Tuple
 
 np.random.seed(42)
 
+# HK Stock Board Lot Sizes (common ones)
+HK_BOARD_LOTS = {
+    '0700.HK': 100,    # Tencent
+    '9988.HK': 100,    # Alibaba
+    '0005.HK': 500,    # HSBC
+    '0941.HK': 500,    # China Mobile
+    '1299.HK': 500,    # AIA
+    '0001.HK': 500,    # CK Hutchison
+    '0388.HK': 100,    # HKEX
+    '0002.HK': 500,    # CLP Holdings
+    '0003.HK': 500,    # HK & China Gas
+    '0011.HK': 500,    # Hang Seng Bank
+    '0016.HK': 500,    # Sun Hung Kai
+    '0027.HK': 500,    # Galaxy Entertainment
+    '0066.HK': 500,    # MTR Corporation
+    '0101.HK': 500,    # Hang Lung Properties
+    '0175.HK': 500,    # Geely Auto
+    '0267.HK': 1000,   # CITIC
+    '0386.HK': 4000,   # Sinopec
+    '0857.HK': 2000,   # PetroChina
+    '0883.HK': 1000,   # CNOOC
+    '0939.HK': 1000,   # CCB
+    '0992.HK': 4000,   # Lenovo
+    '1038.HK': 500,    # CK Infrastructure
+    '1044.HK': 500,    # Vinda Intl
+    '1088.HK': 500,    # Shenhua
+    '1109.HK': 500,    # China Resources Land
+    '1113.HK': 500,    # CK Asset
+    '1177.HK': 500,    # Sino Biopharm
+    '1211.HK': 500,    # BYD
+    '1398.HK': 1000,   # ICBC
+    '1810.HK': 200,    # Xiaomi
+    '1876.HK': 500,    # Budweiser
+    '1928.HK': 500,    # Sands China
+    '1997.HK': 500,    # Wharf REIC
+    '2007.HK': 500,    # Country Garden
+    '2018.HK': 500,    # AAC Tech
+    '2020.HK': 500,    # ANTA Sports
+    '2269.HK': 500,    # WuXi Biologics
+    '2313.HK': 500,    # Shenzhou Intl
+    '2318.HK': 500,    # Ping An
+    '2319.HK': 500,    # Mengniu
+    '2331.HK': 500,    # Li Ning
+    '2382.HK': 500,    # Sunny Optical
+    '2388.HK': 500,    # BOC HK
+    '2628.HK': 1000,   # China Life
+    '3328.HK': 1000,   # Bank of Comm
+    '3690.HK': 100,    # Meituan
+    '3968.HK': 500,    # Merchants Bank
+    '3988.HK': 1000,   # Bank of China
+    '6098.HK': 500,    # Country Garden Services
+    '6618.HK': 500,    # JD Health
+    '9618.HK': 50,     # JD.com
+    '9633.HK': 500,    # Nongfu Spring
+    '9888.HK': 100,    # Baidu
+    '9999.HK': 100,    # NetEase
+}
+
+# Default board lot if not in list
+DEFAULT_HK_BOARD_LOT = 100
+
+# USD/HKD Exchange Rate (update as needed)
+USD_HKD_RATE = 7.82  # 1 USD = 7.82 HKD
+
 
 def get_returns(stocks: list, period: str = '2y') -> pd.DataFrame:
     """Download historical data (supports US + HK stocks)"""
@@ -30,10 +94,7 @@ def get_returns(stocks: list, period: str = '2y') -> pd.DataFrame:
 
 
 def get_dividend_yield(stocks: list) -> Dict[str, float]:
-    """
-    Get trailing dividend yield for each stock
-    Supports US (.US) and HK (.HK) stocks
-    """
+    """Get trailing dividend yield for each stock"""
     print(f"\n📊 Fetching dividend data...")
     dividend_yields = {}
     
@@ -41,11 +102,8 @@ def get_dividend_yield(stocks: list) -> Dict[str, float]:
         try:
             ticker = yf.Ticker(stock)
             info = ticker.info
-            
-            # Get dividend yield (already annualized %)
             div_yield = info.get('trailingAnnualDividendYield', 0)
             
-            # Fallback: calculate from dividend rate and price
             if div_yield == 0 or div_yield is None:
                 div_rate = info.get('trailingAnnualDividendRate', 0)
                 price = info.get('currentPrice', info.get('previousClose', 0))
@@ -53,11 +111,9 @@ def get_dividend_yield(stocks: list) -> Dict[str, float]:
                     div_yield = div_rate / price
             
             dividend_yields[stock] = div_yield if div_yield else 0.0
-            
-        except Exception as e:
+        except:
             dividend_yields[stock] = 0.0
     
-    # Display dividend info
     print(f"{'Stock':<15} {'Div Yield':>12}")
     print("-" * 30)
     for stock, yield_val in dividend_yields.items():
@@ -70,12 +126,7 @@ def get_dividend_yield(stocks: list) -> Dict[str, float]:
 def get_capm_returns(stocks: list, returns: pd.DataFrame, risk_free: float = 0.04,
                      dividend_yields: Dict[str, float] = None,
                      market_ticker: str = '^GSPC', period: str = '2y') -> pd.Series:
-    """
-    CAPM Expected Returns WITH DIVIDEND YIELD
-    
-    Total Expected Return = CAPM Price Return + Dividend Yield
-    E[R_total] = Rf + β × (E[Rm] - Rf) + Dividend_Yield
-    """
+    """CAPM Expected Returns WITH DIVIDEND YIELD"""
     print(f"\n📥 Downloading market data ({market_ticker})...")
     
     market_data = yf.download(market_ticker, period=period, threads=False, progress=False, auto_adjust=False)
@@ -109,10 +160,7 @@ def get_capm_returns(stocks: list, returns: pd.DataFrame, risk_free: float = 0.0
         else:
             beta = 1.0
         
-        # CAPM price return
         capm_price_return = risk_free + beta * market_excess
-        
-        # Add dividend yield
         div_yield = dividend_yields.get(stock, 0.0) if dividend_yields else 0.0
         total_return = capm_price_return + div_yield
         
@@ -123,6 +171,30 @@ def get_capm_returns(stocks: list, returns: pd.DataFrame, risk_free: float = 0.0
     print("-" * 55)
     
     return pd.Series(capm_mu)
+
+
+def get_board_lot(stock: str) -> int:
+    """Get board lot size for HK stocks"""
+    if stock.endswith('.HK'):
+        return HK_BOARD_LOTS.get(stock, DEFAULT_HK_BOARD_LOT)
+    return 1  # US stocks: 1 share
+
+
+def get_stock_currency(stock: str) -> str:
+    """Get trading currency for stock"""
+    if stock.endswith('.HK'):
+        return 'HKD'
+    return 'USD'
+
+
+def convert_to_base_currency(amount: float, stock: str, to_usd: bool = True) -> float:
+    """Convert between HKD and USD"""
+    if stock.endswith('.HK'):
+        if to_usd:
+            return amount / USD_HKD_RATE  # HKD → USD
+        else:
+            return amount * USD_HKD_RATE  # USD → HKD
+    return amount  # USD stays USD
 
 
 def solve_tangency_sharpe(mu: np.ndarray, Sigma: np.ndarray, risk_free: float) -> Tuple[np.ndarray, float, float, float]:
@@ -295,6 +367,53 @@ def solve_portfolio(mu: np.ndarray, Sigma: np.ndarray, risk_free: float, budget:
     }
 
 
+def calculate_shares_with_board_lots(weights: np.ndarray, budget: float, 
+                                      prices: np.ndarray, stocks: list) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Calculate shares respecting board lot requirements for HK stocks
+    
+    Returns:
+    - shares: Number of shares to buy
+    - actual_values: Actual value invested per stock (in USD)
+    - board_lots: Board lot size for each stock
+    """
+    shares = np.zeros(len(weights), dtype=int)
+    actual_values = np.zeros(len(weights))
+    board_lots = np.array([get_board_lot(stock) for stock in stocks])
+    
+    # Calculate budget allocation per stock (in USD)
+    stock_budgets = weights * budget
+    
+    for i, stock in enumerate(stocks):
+        if weights[i] < 0.001:
+            continue
+        
+        price_usd = prices[i]
+        
+        # Convert HKD price to USD for calculation
+        if stock.endswith('.HK'):
+            price_usd = prices[i] / USD_HKD_RATE
+        
+        # Calculate raw shares
+        raw_shares = int(stock_budgets[i] / price_usd) if price_usd > 0 else 0
+        
+        # Apply board lot requirement for HK stocks
+        if stock.endswith('.HK'):
+            lot_size = board_lots[i]
+            # Round down to nearest board lot
+            shares[i] = (raw_shares // lot_size) * lot_size
+        else:
+            shares[i] = raw_shares
+        
+        # Calculate actual value invested
+        if stock.endswith('.HK'):
+            actual_values[i] = (shares[i] * prices[i]) / USD_HKD_RATE  # HKD → USD
+        else:
+            actual_values[i] = shares[i] * prices[i]
+    
+    return shares, actual_values, board_lots
+
+
 def run_monte_carlo(weights: np.ndarray, mu: np.ndarray, Sigma: np.ndarray, 
                     budget: float, risk_free: float, weight_rf: float,
                     days: int = 252, simulations: int = 5000) -> Dict:
@@ -336,9 +455,7 @@ def run_monte_carlo(weights: np.ndarray, mu: np.ndarray, Sigma: np.ndarray,
 
 
 def main():
-    # Configuration - SUPPORTS US AND HK STOCKS!
-    # US Stocks: 'AAPL', 'MSFT', etc.
-    # HK Stocks: '0700.HK' (Tencent), '9988.HK' (Alibaba), '0005.HK' (HSBC)
+    # Configuration - US + HK STOCKS
     all_stocks = sorted([
     # 🇺🇸 美股 (12檔)
     "MSFT",   # Microsoft - 雲端與AI
@@ -363,20 +480,21 @@ def main():
     "0883.HK",  # 中海油 CNOOC - 能源
     "0941.HK",  # 中國移動 China Mobile - 電訊
     "0388.HK",  # 港交所 HKEX - 金融基建
+    "0002.HK"
 ])
     risk_free_rate = 0.04
-    budget = 100000
+    budget = 100000  # In USD
     target_return = 0.12
     max_k = 6
-    market_ticker = '^GSPC'  # Use ^HSI for HK market benchmark
+    market_ticker = '^GSPC'  # Use ^HSI for HK-heavy portfolios
 
-    print(f"\n{'='*60}")
+    print(f"\n{'='*70}")
     print(f"PORTFOLIO OPTIMIZATION (US + HK STOCKS)")
-    print(f"{'='*60}")
+    print(f"{'='*70}")
     print(f"Stocks: {', '.join(all_stocks)}")
-    print(f"Budget: ${budget:,.0f} | Target: {target_return:.0%} | Rf: {risk_free_rate:.0%}")
-    print(f"Max Stocks: {max_k} | Market: {market_ticker}")
-    print(f"{'='*60}\n")
+    print(f"Budget: ${budget:,.0f} USD | Target: {target_return:.0%} | Rf: {risk_free_rate:.0%}")
+    print(f"Max Stocks: {max_k} | Market: {market_ticker} | FX: 1 USD = {USD_HKD_RATE} HKD")
+    print(f"{'='*70}\n")
 
     # 1. Get Historical Returns
     returns = get_returns(all_stocks)
@@ -412,60 +530,78 @@ def main():
     portfolio = solve_portfolio(sel_mu, sel_Sigma, risk_free_rate, budget, sel_stocks, 
                                  target_return, stocks, sel_idx)
     
-    # 8. Calculate Shares
+    # 8. Calculate Shares (WITH BOARD LOTS!)
     weights = portfolio['final_weights']
-    shares = np.floor((weights * budget) / prices).astype(int)
+    shares, actual_values, board_lots = calculate_shares_with_board_lots(weights, budget, prices, stocks)
     
     # 9. Monte Carlo
     mc = run_monte_carlo(weights, mu, Sigma, budget, risk_free_rate, portfolio['weight_rf'])
     
     # Output: Tangency Portfolio
-    print(f"\n{'='*60}")
+    print(f"\n{'='*70}")
     print(f"TANGENCY PORTFOLIO (Maximum Sharpe Ratio)")
-    print(f"{'='*60}")
+    print(f"{'='*70}")
     print(f"Return: {portfolio['tangency_return']:.2%} | Vol: {portfolio['tangency_vol']:.2%} | Sharpe: {portfolio['tangency_sharpe']:.4f}")
-    print(f"{'-'*60}")
+    print(f"{'-'*70}")
     
     # Output: Final Portfolio
-    print(f"\n{'='*60}")
+    print(f"\n{'='*70}")
     print(f"FINAL PORTFOLIO")
-    print(f"{'='*60}")
+    print(f"{'='*70}")
     print(f"Strategy: {portfolio['strategy']}")
     print(f"Return: {portfolio['final_return']:.2%} | Vol: {portfolio['final_vol']:.2%} | Sharpe: {portfolio['final_sharpe']:.4f}")
     print(f"Risk-Free: {portfolio['weight_rf']:.0%} | Active Stocks: {portfolio['active_stocks']}")
-    print(f"{'-'*60}")
-    print(f"{'Stock':<15} {'Weight':>10} {'Shares':>10} {'Price':>12} {'Value':>14} {'Div':>8}")
-    print(f"{'-'*60}")
+    print(f"{'-'*70}")
+    print(f"{'Stock':<15} {'Weight':>10} {'Shares':>10} {'Price':>12} {'Value(USD)':>14} {'Div':>8}")
+    print(f"{'-'*70}")
     
     total_value = 0
     for i, stock in enumerate(stocks):
         if weights[i] > 0.001 or shares[i] > 0:
-            value = shares[i] * prices[i]
+            value = actual_values[i]
             total_value += value
             div = dividend_yields.get(stock, 0.0)
-            print(f"{stock:<15} {weights[i]:>9.2%} {shares[i]:>10} ${prices[i]:>10.2f} ${value:>12,.2f} {div:>7.2%}")
+            currency = 'HKD' if stock.endswith('.HK') else 'USD'
+            lot = board_lots[i]
+            price_display = f"${prices[i]:.2f} {currency}"
+            
+            print(f"{stock:<15} {weights[i]:>9.2%} {shares[i]:>10} {price_display:>12} ${value:>12,.2f} {div:>7.2%}")
     
-    print(f"{'-'*60}")
-    print(f"Total Stocks: ${total_value:,.2f} | Cash (RF): ${budget - total_value:,.2f}")
+    print(f"{'-'*70}")
+    print(f"Total Stocks: ${total_value:,.2f} USD | Cash (RF): ${budget - total_value:,.2f} USD")
     
     # Output: Risk Metrics
-    print(f"\n{'='*60}")
+    print(f"\n{'='*70}")
     print(f"RISK METRICS (1-Year Monte Carlo)")
-    print(f"{'='*60}")
+    print(f"{'='*70}")
     print(f"Median Value: ${mc['median']:,.2f} | Profit Prob: {mc['prob_profit']:.0%}")
     print(f"VaR (95%): ${mc['var_95']:,.2f} | CVaR (95%): ${mc['cvar_95']:,.2f}")
-    print(f"{'='*60}\n")
+    print(f"{'='*70}")
     
     # Output: Dividend Summary
-    print(f"{'='*60}")
+    print(f"\n{'='*70}")
     print(f"DIVIDEND SUMMARY")
-    print(f"{'='*60}")
+    print(f"{'='*70}")
     portfolio_div_yield = sum(weights[i] * dividend_yields.get(stock, 0.0) for i, stock in enumerate(stocks))
     annual_div_income = portfolio_div_yield * total_value
     print(f"Portfolio Dividend Yield: {portfolio_div_yield:.2%}")
-    print(f"Estimated Annual Dividend Income: ${annual_div_income:,.2f}")
-    print(f"{'='*60}\n")
+    print(f"Estimated Annual Dividend Income: ${annual_div_income:,.2f} USD")
+    print(f"{'='*70}")
+    
+    # Output: Board Lot Summary
+    hk_stocks_in_portfolio = [stocks[i] for i in range(len(stocks)) if stocks[i].endswith('.HK') and shares[i] > 0]
+    if hk_stocks_in_portfolio:
+        print(f"\n{'='*70}")
+        print(f"HK STOCK BOARD LOT SUMMARY")
+        print(f"{'='*70}")
+        for stock in hk_stocks_in_portfolio:
+            idx = stocks.index(stock)
+            lot = board_lots[idx]
+            print(f"{stock}: {shares[idx]} shares = {shares[idx] // lot} board lots (lot size: {lot})")
+        print(f"{'='*70}\n")
+    else:
+        print()
 
 
 if __name__ == "__main__":
-    main() 
+    main()
